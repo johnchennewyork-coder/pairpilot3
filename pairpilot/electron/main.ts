@@ -24,11 +24,12 @@ let tray: Tray | null;
 const store = new Store();
 
 function createSplashWindow() {
+  const preloadPath = path.join(__dirname, 'preload.js');
   mainWindow = new BrowserWindow({
     width: 800,
     height: 600,
     webPreferences: {
-      preload: path.join(__dirname, 'preload.mjs'),
+      preload: preloadPath,
       nodeIntegration: false,
       contextIsolation: true,
       sandbox: false,
@@ -56,7 +57,7 @@ function createTimelineWindow() {
     width: 900,
     height: 700,
     webPreferences: {
-      preload: path.join(__dirname, 'preload.mjs'),
+      preload: path.join(__dirname, 'preload.js'),
       nodeIntegration: false,
       contextIsolation: true,
       sandbox: false,
@@ -89,7 +90,7 @@ function createFloatingWindow() {
     frame: false,
     alwaysOnTop: true,
     webPreferences: {
-      preload: path.join(__dirname, 'preload.mjs'),
+      preload: path.join(__dirname, 'preload.js'),
       nodeIntegration: true,
       contextIsolation: true,
       sandbox: false,
@@ -132,11 +133,6 @@ function createTray() {
 import { askGemini, evaluateInterview } from './gemini';
 
   app.whenReady().then(() => {
-    // Avoid macOS "SetApplicationIsDaemon paramErr -50" by keeping dock visible (Chromium quirk with tray-only apps)
-    if (process.platform === 'darwin') {
-      app.dock?.show();
-    }
-
     // Clear previous session history on fresh app start
     store.delete('interviewHistory');
     store.delete('interviewHistoryObjs');
@@ -154,16 +150,13 @@ import { askGemini, evaluateInterview } from './gemini';
     // Create main window/tray logic
     createTray();
   
-  // Show splash on start if settings missing, else start assistant
+  // Pre-fill API key from .env if present and not yet saved
   if (!store.get('geminiApiKey') && process.env.GEMINI_API_KEY) {
     store.set('geminiApiKey', process.env.GEMINI_API_KEY);
   }
 
-  if (!store.get('geminiApiKey')) {
-    createSplashWindow();
-  } else {
-    createFloatingWindow();
-  }
+  // Always open with splash/settings on startup; user clicks "Start Assistant" to open the chat
+  createSplashWindow();
 
   // Register hotkeys
   globalShortcut.register('CommandOrControl+Shift+A', () => {
@@ -198,8 +191,8 @@ import { askGemini, evaluateInterview } from './gemini';
   });
   
   ipcMain.handle('start-assistant', () => {
-    // Check mic permission on macOS proactively to trigger prompt
-    if (process.platform === 'darwin') {
+    // Check mic permission on macOS proactively to trigger prompt ONLY if enabled
+    if (process.platform === 'darwin' && store.get('enableAudio') === true) {
       const micStatus = systemPreferences.getMediaAccessStatus('microphone');
       if (micStatus === 'not-determined') {
         systemPreferences.askForMediaAccess('microphone');

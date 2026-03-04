@@ -9,11 +9,12 @@ function App() {
   return (
     <HashRouter>
       <Routes>
+        <Route path="/" element={<Settings />} />
         <Route path="/splash" element={<Settings />} />
         <Route path="/assistant" element={<FloatingAssistant />} />
         <Route path="/evaluation" element={<EvaluationResult />} />
         <Route path="/timeline" element={<Timeline />} />
-        <Route path="*" element={<Navigate to="/splash" />} />
+        <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>
     </HashRouter>
   );

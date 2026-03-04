@@ -7,28 +7,37 @@ const FloatingAssistant = () => {
   const navigate = useNavigate();
   const [running, setRunning] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
-  const [history, setHistory] = useState<{ time: string; msg: string }[]>([]);
+  const [progressMessage, setProgressMessage] = useState<string | null>(null);
+  type ChatEntry = { time: string; msg: string; role?: 'context' | 'response' };
+  const [history, setHistory] = useState<ChatEntry[]>([]);
   const [nextCaptureSec, setNextCaptureSec] = useState<number | null>(null);
   const recorderRef = useRef<AudioRecorder>(new AudioRecorder());
   const intervalRef = useRef<NodeJS.Timeout | null>(null);
   const countdownIntervalRef = useRef<NodeJS.Timeout | null>(null);
   const timerRef = useRef<NodeJS.Timeout | null>(null);
   const screenshotCountRef = useRef(0);
-  const configRef = useRef({ maxScreenshots: 50, maxTimeMin: 45 });
+  const configRef = useRef({ maxScreenshots: 50, maxTimeMin: 45, enableAudio: false });
 
   useEffect(() => {
-    // Load previously saved history if available
-    window.electronAPI.getStoreValue('interviewHistoryObjs').then(val => {
-      if (val && Array.isArray(val)) setHistory(val);
+    window.electronAPI.getStoreValue('interviewHistoryObjs').then((val: ChatEntry[] | unknown) => {
+      if (val && Array.isArray(val)) {
+        setHistory(val.map((h: { time?: string; msg: string; role?: string }) => ({
+          time: h.time || '',
+          msg: h.msg,
+          role: h.role === 'context' ? 'context' : 'response',
+        })));
+      }
     });
 
     // Load configs
     Promise.all([
       window.electronAPI.getStoreValue('maxScreenshots'),
-      window.electronAPI.getStoreValue('maxTimeMin')
-    ]).then(([maxS, maxT]) => {
+      window.electronAPI.getStoreValue('maxTimeMin'),
+      window.electronAPI.getStoreValue('enableAudio')
+    ]).then(([maxS, maxT, audioEnabled]) => {
       configRef.current.maxScreenshots = maxS || 50;
       configRef.current.maxTimeMin = maxT || 45;
+      configRef.current.enableAudio = !!audioEnabled;
     });
   }, []);
 
@@ -36,127 +45,164 @@ const FloatingAssistant = () => {
     if (intervalRef.current) clearInterval(intervalRef.current);
     if (countdownIntervalRef.current) clearInterval(countdownIntervalRef.current);
     if (timerRef.current) clearTimeout(timerRef.current);
-    await recorderRef.current.stopAndGetBlob();
+    
+    if (configRef.current.enableAudio) {
+      await recorderRef.current.stopAndGetBlob();
+    }
     setRunning(false);
     setNextCaptureSec(null);
   };
 
   const startRecording = async () => {
-    setRunning(true);
-    screenshotCountRef.current = 0;
-    
-    setHistory([]);
-    await window.electronAPI.setStoreValue('interviewHistoryObjs', []);
-    await window.electronAPI.setStoreValue('interviewHistory', []);
+    try {
+      setRunning(true);
+      screenshotCountRef.current = 0;
+      
+      setHistory([]);
+      await window.electronAPI.setStoreValue('interviewHistoryObjs', []);
+      await window.electronAPI.setStoreValue('interviewHistory', []);
 
-    const intervalSec = (await window.electronAPI.getStoreValue('intervalSec')) || 30;
+      const intervalSec = (await window.electronAPI.getStoreValue('intervalSec')) || 30;
 
-    // Show countdown immediately and start ticking (before first capture)
-    setNextCaptureSec(intervalSec);
-    if (countdownIntervalRef.current) clearInterval(countdownIntervalRef.current);
-    countdownIntervalRef.current = setInterval(() => {
-      setNextCaptureSec((prev) => {
-        if (prev === null) return intervalSec;
-        if (prev <= 1) return intervalSec;
-        return prev - 1;
-      });
-    }, 1000);
+      // Start the mic stream before we attempt the first cycle
+      if (configRef.current.enableAudio) {
+        await recorderRef.current.start();
+      }
 
-    // Setup the main capture interval
-    intervalRef.current = setInterval(() => {
+      // Show countdown immediately and start ticking (before first capture)
+      setNextCaptureSec(intervalSec);
+      if (countdownIntervalRef.current) clearInterval(countdownIntervalRef.current);
+      countdownIntervalRef.current = setInterval(() => {
+        setNextCaptureSec((prev) => {
+          if (prev === null) return intervalSec;
+          if (prev <= 1) return intervalSec;
+          return prev - 1;
+        });
+      }, 1000);
+
+      // Setup the main capture interval
+      intervalRef.current = setInterval(() => {
+        doCapture();
+      }, intervalSec * 1000);
+      
+      // We don't await doCapture() here because it runs on a loop, and if it fails internally it handles its own UI state. 
+      // We just fire it off.
       doCapture();
-    }, intervalSec * 1000);
-    
-    await recorderRef.current.start();
-    await doCapture();
 
-    // Stop automatically after max time
-    if (configRef.current.maxTimeMin > 0) {
-      timerRef.current = setTimeout(() => {
-        stopRecording();
-      }, configRef.current.maxTimeMin * 60 * 1000);
+      // Stop automatically after max time
+      if (configRef.current.maxTimeMin > 0) {
+        timerRef.current = setTimeout(() => {
+          stopRecording();
+        }, configRef.current.maxTimeMin * 60 * 1000);
+      }
+    } catch (err: any) {
+      console.error('Start Recording Error:', err);
+      setHistory([{ time: new Date().toLocaleTimeString(), msg: `Start Error: ${err.message || String(err)}` }]);
+      stopRecording();
     }
   };
 
   const doCapture = async () => {
-    if (screenshotCountRef.current >= configRef.current.maxScreenshots) {
-      stopRecording();
-      return;
-    }
-    screenshotCountRef.current += 1;
-    const audioBlob = await recorderRef.current.stopAndGetBlob();
-    await recorderRef.current.start();
-
-    const imageBase64 = await window.electronAPI.captureScreen();
-    const prompt = await window.electronAPI.getStoreValue('systemPrompt') || 'Give hints and summarize progress.';
-    
-    let audioBase64: string | null = null;
-    let audioMime: string | null = null;
-    
-    if (audioBlob && audioBlob.size > 0) {
-      const buffer = await audioBlob.arrayBuffer();
-      // Fast buffer to base64
-      let binary = '';
-      const bytes = new Uint8Array(buffer);
-      const len = bytes.byteLength;
-      for (let i = 0; i < len; i++) {
-        binary += String.fromCharCode(bytes[i]);
-      }
-      audioBase64 = btoa(binary);
-      audioMime = audioBlob.type;
-    }
-
-    const intervalSec = await window.electronAPI.getStoreValue('intervalSec') || 30;
-    
-    // Reset countdown correctly when doing manual force capture
-    setNextCaptureSec(intervalSec);
-    if (countdownIntervalRef.current) clearInterval(countdownIntervalRef.current);
-    countdownIntervalRef.current = setInterval(() => {
-      setNextCaptureSec((prev) => {
-        if (prev === null) return intervalSec;
-        if (prev <= 1) return intervalSec;
-        return prev - 1;
-      });
-    }, 1000);
-    
     try {
+      if (screenshotCountRef.current >= configRef.current.maxScreenshots) {
+        stopRecording();
+        return;
+      }
+      screenshotCountRef.current += 1;
+      setIsProcessing(true);
+      setProgressMessage('Capturing screenshot…');
+
+      let audioBlob: Blob | null = null;
+      if (configRef.current.enableAudio) {
+        setProgressMessage('Capturing audio chunk…');
+        audioBlob = await recorderRef.current.stopAndGetBlob();
+        await recorderRef.current.start();
+      }
+
+      const imageBase64 = await window.electronAPI.captureScreen();
+      setProgressMessage('Screenshot captured. Sending request to Gemini…');
+      const prompt = await window.electronAPI.getStoreValue('systemPrompt') || 'Give hints and summarize progress.';
+
+      let audioBase64: string | null = null;
+      let audioMime: string | null = null;
+      if (audioBlob && audioBlob.size > 0) {
+        const buffer = await audioBlob.arrayBuffer();
+        let binary = '';
+        const bytes = new Uint8Array(buffer);
+        const len = bytes.byteLength;
+        for (let i = 0; i < len; i++) {
+          binary += String.fromCharCode(bytes[i]);
+        }
+        audioBase64 = btoa(binary);
+        audioMime = audioBlob.type;
+      }
+
+      const intervalSec = await window.electronAPI.getStoreValue('intervalSec') || 30;
+      setNextCaptureSec(intervalSec);
+      if (countdownIntervalRef.current) clearInterval(countdownIntervalRef.current);
+      countdownIntervalRef.current = setInterval(() => {
+        setNextCaptureSec((prev) => {
+          if (prev === null) return intervalSec;
+          if (prev <= 1) return intervalSec;
+          return prev - 1;
+        });
+      }, 1000);
+
+      setProgressMessage('Request sent. Waiting for response…');
+      const now = new Date().toLocaleTimeString();
+      setHistory(prev => {
+        const withContext = [...prev, { time: now, msg: 'Calling model with this context.', role: 'context' as const }];
+        window.electronAPI.setStoreValue('interviewHistoryObjs', withContext);
+        return withContext;
+      });
+
       const response = await window.electronAPI.askGemini(prompt, imageBase64, audioBase64, audioMime);
+      setProgressMessage('Response received.');
       if (response) {
         setHistory(prev => {
-          const newHist = [...prev, { time: new Date().toLocaleTimeString(), msg: response }];
+          const newHist = [...prev, { time: new Date().toLocaleTimeString(), msg: response, role: 'response' as const }];
           window.electronAPI.setStoreValue('interviewHistoryObjs', newHist);
-          window.electronAPI.setStoreValue('interviewHistory', newHist.map(h => h.msg));
+          window.electronAPI.setStoreValue('interviewHistory', newHist.filter(h => h.role === 'response').map(h => h.msg));
           return newHist;
         });
       }
-    } catch (err) {
-      console.error(err);
+    } catch (err: any) {
+      console.error('doCapture Error:', err);
+      setProgressMessage(`Error: ${err.message || String(err)}`);
       setHistory(prev => {
-        const newHist = [...prev, { time: new Date().toLocaleTimeString(), msg: 'Error: Failed to fetch AI response' }];
+        const newHist = [...prev, { time: new Date().toLocaleTimeString(), msg: `Error: ${err.message || String(err)}`, role: 'response' as const }];
         window.electronAPI.setStoreValue('interviewHistoryObjs', newHist);
-        window.electronAPI.setStoreValue('interviewHistory', newHist.map(h => h.msg));
+        window.electronAPI.setStoreValue('interviewHistory', newHist.filter(h => h.role === 'response').map(h => h.msg));
         return newHist;
       });
     } finally {
       setIsProcessing(false);
+      setProgressMessage(null);
     }
   };
 
+  // Subscribe to force-capture hotkey; cleanup only unsubscribes, does NOT stop recording
   useEffect(() => {
     const unsub = window.electronAPI.onForceCapture(() => {
       if (running) {
         doCapture();
       }
     });
-    
-    const recorder = recorderRef.current;
-    
     return () => {
-      stopRecording();
-      recorder.destroy();
       unsub();
     };
   }, [running]);
+
+  // On unmount, stop recording and destroy recorder
+  useEffect(() => {
+    const recorder = recorderRef.current;
+    return () => {
+      if (intervalRef.current) clearInterval(intervalRef.current);
+      if (countdownIntervalRef.current) clearInterval(countdownIntervalRef.current);
+      if (timerRef.current) clearTimeout(timerRef.current);
+      recorder.destroy();
+    };
+  }, []);
 
   const toggleRun = () => {
     if (running) stopRecording();
@@ -207,27 +253,30 @@ const FloatingAssistant = () => {
       </div>
 
       <div className="flex-1 p-4 overflow-y-auto no-drag">
-        {history.length === 0 ? (
+        {!running && history.length === 0 ? (
           <div className="text-gray-400 text-sm text-center mt-10 space-y-3">
             <p>Assistant is idle. Click Start to begin recording screen & audio.</p>
-            {isProcessing && (
-              <p className="text-blue-500 font-medium animate-pulse bg-blue-50 p-3 rounded-lg border border-blue-100">Capturing initial context...</p>
-            )}
           </div>
         ) : (
           <ul className="space-y-4">
             {history.map((h, i) => (
-              <li key={i} className="text-sm">
-                <span className="text-xs text-gray-500 block mb-1">{h.time}</span>
-                <span className="text-gray-800 leading-relaxed bg-blue-50 p-3 rounded-lg block whitespace-pre-wrap">
+              <li key={i} className={`text-sm ${h.role === 'context' ? 'flex justify-end' : ''}`}>
+                <span className={`text-xs text-gray-500 block mb-1 ${h.role === 'context' ? 'text-right' : ''}`}>{h.time}</span>
+                <span
+                  className={
+                    h.role === 'context'
+                      ? 'inline-block text-gray-600 leading-relaxed bg-slate-100 border border-slate-200 px-3 py-2 rounded-lg text-sm'
+                      : 'text-gray-800 leading-relaxed bg-blue-50 p-3 rounded-lg block whitespace-pre-wrap'
+                  }
+                >
                   {h.msg}
                 </span>
               </li>
             ))}
             {isProcessing && (
               <li className="text-sm">
-                <span className="text-blue-500 font-medium leading-relaxed bg-blue-50 p-3 rounded-lg border border-blue-100 block animate-pulse">
-                  Analyzing current screen...
+                <span className="text-blue-700 font-medium leading-relaxed bg-blue-50 p-3 rounded-lg border border-blue-200 block">
+                  {progressMessage || (history.length === 0 ? 'Capturing initial context…' : 'Analyzing current screen…')}
                 </span>
               </li>
             )}
